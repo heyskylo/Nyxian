@@ -24,6 +24,7 @@
 
 #import <UI/NXVolumeButtonMonitor.h>
 #import <UI/NXRecoveryViewController.h>
+#import <UI/NXBootMenuViewController.h>
 
 #import <LindChain/ProcEnvironment/LiveContainer/LCUtils.h>
 #import <LindChain/ProcEnvironment/PEExtension.h>

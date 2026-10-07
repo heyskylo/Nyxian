@@ -444,31 +444,28 @@ private func refreshVnode(atPath path: String) -> Bool {
     return fcopyfile(fd, copyfd, nil, copyfile_flags_t(COPYFILE_DATA)) == 0
 }
 
-private func flashedSlotURL() -> URL {
-    URL(fileURLWithPath: NSHomeDirectory()).appendingPathComponent("Library/Boot/Slot/A")
-}
-
 private func lastDlError() -> String {
     if let err = dlerror() { return String(cString: err) }
     return "unknown dyld error"
 }
 
-private func loadSlot(loadSuperslotForcefully: Bool) -> SlotLoadResult {
+private func loadSlot(loadSuperslotForcefully: Bool, explicitSlot: URL? = nil) -> SlotLoadResult {
     let fm = FileManager.default
-    let slot = flashedSlotURL()
-    let manifestURL = slot.appendingPathComponent("manifest.plist")
     
     let image: URL
     let name: String
     
-    if fm.fileExists(atPath: manifestURL.path),
-       !loadSuperslotForcefully {
+    if !loadSuperslotForcefully, let slot = explicitSlot {
+        let manifestURL = slot.appendingPathComponent("manifest.plist")
+        guard fm.fileExists(atPath: manifestURL.path) else {
+            return .failed("selected ROM is missing manifest.plist")
+        }
         do {
             let manifest = try ROMManifest(manifestPlistURL: manifestURL)
             image = try slotFile(manifest.executable, in: slot)
             name = manifest.name
         } catch {
-            return .failed("flashed ROM is invalid: \(error.localizedDescription)")
+            return .failed("selected ROM is invalid: \(error.localizedDescription)")
         }
         guard fm.fileExists(atPath: image.path) else {
             return .failed("\(name): executable missing")
@@ -810,8 +807,7 @@ func recoveryConfirmWipe(recoveryController c: NXRecoveryViewController) {
     )
 }
 
-@discardableResult private func runUninstaller(_ log: RomLog) -> Bool {
-    let slot = flashedSlotURL()
+@discardableResult private func runUninstaller(_ log: RomLog, at slot: URL) -> Bool {
     let manifestURL = slot.appendingPathComponent("manifest.plist")
     guard FileManager.default.fileExists(atPath: manifestURL.path) else { return true }
     
@@ -828,40 +824,32 @@ func recoveryConfirmWipe(recoveryController c: NXRecoveryViewController) {
     }
 }
 
-private func removeFlashedSlot(_ log: RomLog) {
+private func removeFlashedSlot(_ log: RomLog, at slot: URL) {
     do {
-        try FileManager.default.removeItem(at: flashedSlotURL())
-        log.info("flashed ROM removed, next boot uses SuperSlot.dylib")
+        try NXROMStore.remove(slot)
+        log.info("ROM removed")
     } catch {
         log.error("ERROR: \(errnoDescription(error))")
     }
 }
 
-func recoveryShowUnflash(recoveryController c: NXRecoveryViewController) {
-    guard !romIsBusy(c) else { return }
-    
-    let slot = flashedSlotURL()
-    guard FileManager.default.fileExists(atPath: slot.path) else {
-        c.recoveryLogError("no ROM flashed")
-        return
-    }
-    
-    let manifest = try? ROMManifest(manifestPlistURL: slot.appendingPathComponent("manifest.plist"))
+private func recoveryShowUnflashConfirm(recoveryController c: NXRecoveryViewController, rom: NXROMEntry) {
+    let slot = rom.url
     
     let header: String
-    if let manifest {
+    if let manifest = rom.manifest {
         header = "Unflash \(manifest.name) \(manifest.version)?\n\(manifest.identifier)"
     } else {
-        header = "Unflash ROM?\nmanifest unreadable, only force removal possible"
+        header = "Unflash \(rom.url.lastPathComponent)?\nmanifest unreadable, only force removal possible"
     }
     
     var items: [NXRecoveryItem] = [
         NXRecoveryItem(title: "../") { c in
-            if let c = c { recoveryShowMenu(recoveryController: c) }
+            if let c = c { recoveryShowUnflash(recoveryController: c) }
         }
     ]
     
-    if let manifest {
+    if let manifest = rom.manifest {
         let title = manifest.uninstaller != nil ? "Uninstall ROM" : "Remove ROM (no uninstaller)"
         items.append(NXRecoveryItem(title: title) { c in
             guard let c = c else { return }
@@ -869,11 +857,11 @@ func recoveryShowUnflash(recoveryController c: NXRecoveryViewController) {
             runRomOperation(c) { log in
                 log.info("\n-- Unflashing \(manifest.name)...")
                 
-                guard runUninstaller(log) else {
+                guard runUninstaller(log, at: slot) else {
                     log.error("ROM kept, use force removal to delete it anyway")
                     return
                 }
-                removeFlashedSlot(log)
+                removeFlashedSlot(log, at: slot)
             }
         })
     }
@@ -883,8 +871,8 @@ func recoveryShowUnflash(recoveryController c: NXRecoveryViewController) {
         recoveryShowMenu(recoveryController: c)
         runRomOperation(c) { log in
             log.info("\n-- Force removing ROM...")
-            log.error("uninstaller skipped, leftovers outside the slot may remain")
-            removeFlashedSlot(log)
+            log.error("uninstaller skipped, leftovers outside the ROM directory may remain")
+            removeFlashedSlot(log, at: slot)
         }
     })
     
@@ -898,99 +886,143 @@ func recoveryShowUnflash(recoveryController c: NXRecoveryViewController) {
     )
 }
 
+func recoveryShowUnflash(recoveryController c: NXRecoveryViewController) {
+    guard !romIsBusy(c) else { return }
+    
+    let roms = NXROMStore.allSlots()
+    guard !roms.isEmpty else {
+        c.recoveryLogError("no ROM flashed")
+        return
+    }
+    
+    var items: [NXRecoveryItem] = [
+        NXRecoveryItem(title: "../") { c in
+            if let c = c { recoveryShowMenu(recoveryController: c) }
+        }
+    ]
+    
+    for rom in roms {
+        let title = rom.displayTitle
+        items.append(NXRecoveryItem(title: title) { c in
+            if let c = c { recoveryShowUnflashConfirm(recoveryController: c, rom: rom) }
+        })
+    }
+    
+    c.enterRecovery(
+        withHeader: "Unflash ROM\nselect a flashed ROM to remove",
+        instructions: nil,
+        footer: nil,
+        items: items,
+        onSelect: nil,
+        onMove: nil
+    )
+}
+
 private func flashROM(archive: URL, log: RomLog) throws -> ROMManifest {
     let fm = FileManager.default
-    let slot = flashedSlotURL()
     
     log.info("\n-- Flashing rom...")
     log.info("selected rom: \(archive.lastPathComponent)")
     
-    try? fm.removeItem(at: slot)
-    try fm.createDirectory(at: slot, withIntermediateDirectories: true, attributes: [:])
+    NXROMStore.migrateIfNeeded()
+    let incoming = NXROMStore.stagingURL()
+    var installed: URL?
     
-    guard unzipArchiveAtPathWithoutParentDirectory(archive.path, slot.path) else {
-        throw romError("failed to extract ROM")
-    }
-    
-    log.info("extracted rom")
-    
-    let manifest: ROMManifest = try ROMManifest(manifestPlistURL: slot.appendingPathComponent("manifest.plist"))
-    
-    log.info("setting up default file and directory permissions")
-    guard let enumerator = fm.enumerator(at: slot, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else {
-        throw NSError(domain: "org.emexlabs.nyxian.bootloader.rom-flash", code: 2, userInfo: [NSLocalizedDescriptionKey: "could not enumerate \(slot)"])
-    }
-    var dirs: [URL] = [slot]
-    for case let url as URL in enumerator {
-        let values = try url.resourceValues(forKeys: Set([.isDirectoryKey, .isSymbolicLinkKey]))
-        if values.isSymbolicLink == true { continue }
-        if values.isDirectory == true {
-            dirs.append(url)
-        } else {
-            try fm.setAttributes([.posixPermissions: manifest.defaultFilePermission], ofItemAtPath: url.path)
+    do {
+        guard unzipArchiveAtPathWithoutParentDirectory(archive.path, incoming.path) else {
+            throw romError("failed to extract ROM")
         }
-    }
-    for dir in dirs.reversed() {
-        try fm.setAttributes([.posixPermissions: manifest.defaultDirectoryPermission], ofItemAtPath: dir.path)
-    }
-    
-    log.info("setting up explicit path permissions and configurations")
-    var signFiles: [ROMPath] = []
-    for path in manifest.paths {
-        log.info("setting up \(path.path)")
         
-        if path.codesigning.needed {
-            signFiles.append(path)
-        } else {
-            try fm.setAttributes([.posixPermissions: path.permission], ofItemAtPath: slot.appendingPathComponent(path.path).path)
+        log.info("extracted rom")
+        
+        let manifest: ROMManifest = try ROMManifest(manifestPlistURL: incoming.appendingPathComponent("manifest.plist"))
+        
+        let slot = NXROMStore.allocateSlotURL(for: manifest.identifier)
+        try fm.moveItem(at: incoming, to: slot)
+        installed = slot
+        
+        log.info("setting up default file and directory permissions")
+        guard let enumerator = fm.enumerator(at: slot, includingPropertiesForKeys: [.isDirectoryKey, .isSymbolicLinkKey]) else {
+            throw NSError(domain: "org.emexlabs.nyxian.bootloader.rom-flash", code: 2, userInfo: [NSLocalizedDescriptionKey: "could not enumerate \(slot)"])
         }
-    }
-    
-    if !signFiles.isEmpty {
-        log.info("signing files")
-        for file in signFiles {
-            guard NXSignMachOAuto(slot.appendingPathComponent(file.path)) else {
-                throw romError("failed to sign \(file.path)")
+        var dirs: [URL] = [slot]
+        for case let url as URL in enumerator {
+            let values = try url.resourceValues(forKeys: Set([.isDirectoryKey, .isSymbolicLinkKey]))
+            if values.isSymbolicLink == true { continue }
+            if values.isDirectory == true {
+                dirs.append(url)
+            } else {
+                try fm.setAttributes([.posixPermissions: manifest.defaultFilePermission], ofItemAtPath: url.path)
             }
-            log.info("signed \(file.path)")
+        }
+        for dir in dirs.reversed() {
+            try fm.setAttributes([.posixPermissions: manifest.defaultDirectoryPermission], ofItemAtPath: dir.path)
         }
         
-        log.info("refreshing signed files")
-        for file in signFiles {
-            guard refreshVnode(atPath: slot.appendingPathComponent(file.path).path) else {
-                throw romError("failed to refresh \(file.path)")
+        log.info("setting up explicit path permissions and configurations")
+        var signFiles: [ROMPath] = []
+        for path in manifest.paths {
+            log.info("setting up \(path.path)")
+            
+            if path.codesigning.needed {
+                signFiles.append(path)
+            } else {
+                try fm.setAttributes([.posixPermissions: path.permission], ofItemAtPath: slot.appendingPathComponent(path.path).path)
             }
-            log.info("refreshed \(file.path)")
         }
         
-        log.info("adding NXT2 entitlements if needed")
-        for file in signFiles {
-            if file.codesigning.neededNXT2 {
-                let kr: kern_return_t = trust_nxt2_sign(slot.appendingPathComponent(file.path).path, file.codesigning.nxt2 as CFDictionary, true, nil)
-                if kr != 0 {
-                    throw romError("failed to add NXT2 entitlements to \(file.path): \(String(cString: mach_error_string(kr)))")
+        if !signFiles.isEmpty {
+            log.info("signing files")
+            for file in signFiles {
+                guard NXSignMachOAuto(slot.appendingPathComponent(file.path)) else {
+                    throw romError("failed to sign \(file.path)")
                 }
-                log.info("added NXT2 entitlements to \(file.path)")
+                log.info("signed \(file.path)")
+            }
+            
+            log.info("refreshing signed files")
+            for file in signFiles {
+                guard refreshVnode(atPath: slot.appendingPathComponent(file.path).path) else {
+                    throw romError("failed to refresh \(file.path)")
+                }
+                log.info("refreshed \(file.path)")
+            }
+            
+            log.info("adding NXT2 entitlements if needed")
+            for file in signFiles {
+                if file.codesigning.neededNXT2 {
+                    let kr: kern_return_t = trust_nxt2_sign(slot.appendingPathComponent(file.path).path, file.codesigning.nxt2 as CFDictionary, true, nil)
+                    if kr != 0 {
+                        throw romError("failed to add NXT2 entitlements to \(file.path): \(String(cString: mach_error_string(kr)))")
+                    }
+                    log.info("added NXT2 entitlements to \(file.path)")
+                }
+            }
+            
+            log.info("refixing sign files permissions")
+            for file in signFiles {
+                try fm.setAttributes([.posixPermissions: file.permission], ofItemAtPath: slot.appendingPathComponent(file.path).path)
             }
         }
         
-        log.info("refixing sign files permissions")
-        for file in signFiles {
-            try fm.setAttributes([.posixPermissions: file.permission], ofItemAtPath: slot.appendingPathComponent(file.path).path)
+        if let installer = manifest.installer {
+            log.info("running installer")
+            do {
+                try runRomGeneric(installer, symbol: "NXRomInstall", slot: slot, onLine: log.rom)
+            } catch {
+                throw romError("installer failed: \(error.localizedDescription)")
+            }
+            log.info("installer finished")
         }
-    }
-    
-    if let installer = manifest.installer {
-        log.info("running installer")
-        do {
-            try runRomGeneric(installer, symbol: "NXRomInstall", slot: slot, onLine: log.rom)
-        } catch {
-            throw romError("installer failed: \(error.localizedDescription)")
+        
+        return manifest
+    } catch {
+        try? fm.removeItem(at: incoming)
+        if let installed {
+            try? fm.removeItem(at: installed)
         }
-        log.info("installer finished")
+        throw error
     }
-    
-    return manifest
 }
 
 private func recoveryFlashROM(_ c: NXRecoveryViewController, archive: URL) {
@@ -1009,7 +1041,6 @@ private func recoveryFlashROM(_ c: NXRecoveryViewController, archive: URL) {
             }
         } catch {
             log.error("ERROR: \(error.localizedDescription)")
-            try? FileManager.default.removeItem(at: flashedSlotURL())
             DispatchQueue.main.async {
                 c.recoveryLogError("\nFlash failed.\nPress both volume buttons to return to the menu.")
                 c.finishConsole(selectAction: { c in
@@ -1109,8 +1140,8 @@ class BootViewController: UIViewController {
         splashView.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         self.view.addSubview(splashView)
         
-        let slot: URL = flashedSlotURL()
-        if let manifest: ROMManifest = try? ROMManifest(manifestPlistURL: slot.appendingPathComponent("manifest.plist")),
+        NXROMStore.migrateIfNeeded()
+        if let manifest: ROMManifest = NXROMStore.enumerate().first?.manifest,
            let logo: UIImage = manifest.bootlogo {
             logoView.image = logo
         } else {
@@ -1139,36 +1170,71 @@ class BootViewController: UIViewController {
                 return
             }
             
-            let slot = loadSlot(loadSuperslotForcefully: mode == 1)
+            NXROMStore.migrateIfNeeded()
+            let roms = NXROMStore.enumerate()
+            
+            let result: SlotLoadResult
+            if mode == 1 {
+                result = loadSlot(loadSuperslotForcefully: true)
+            } else if roms.isEmpty {
+                result = loadSlot(loadSuperslotForcefully: false)
+            } else if roms.count == 1 {
+                result = loadSlot(loadSuperslotForcefully: false, explicitSlot: roms[0].url)
+            } else {
+                DispatchQueue.main.async {
+                    self.enterBootMenu(roms)
+                }
+                return
+            }
             
             DispatchQueue.main.async {
-                guard case let .loaded(name, slotMain, slotDidAppear, slotCreateWindow) = slot else {
-                    if case let .failed(message) = slot {
-                        self.enterRecovery(error: "ERROR: \(message)")
-                    }
-                    return
+                self.bootLoaded(result)
+            }
+        }
+    }
+    
+    private func enterBootMenu(_ roms: [NXROMEntry]) {
+        let menu = NXBootMenuViewController(titles: roms.map { $0.displayTitle }) { [weak self] index in
+            let position = Int(index)
+            guard let self, position < roms.count else { return }
+            let chosen = roms[position]
+            DispatchQueue.global(qos: .utility).async {
+                let result = loadSlot(loadSuperslotForcefully: false, explicitSlot: chosen.url)
+                DispatchQueue.main.async {
+                    self.bootLoaded(result)
                 }
-                
-                guard let raw = slotMain() else {
-                    self.enterRecovery(error: "ERROR: \(name) NXSlotMain returned no view controller")
-                    return
-                }
-                let slotRoot = Unmanaged<UIViewController>.fromOpaque(raw).takeRetainedValue()
-                
-                self.changableStatusBarHidden = false
-                UIView.animate(withDuration: 0.3) {
-                    self.setNeedsStatusBarAppearanceUpdate()
-                }
-                
-                if let slotCreateWindow, let slotWindow = self.makeSlotWindow(slotCreateWindow) {
-                    self.transition(into: slotWindow, root: slotRoot) {
-                        slotDidAppear?()
-                    }
-                } else {
-                    self.transition(to: slotRoot) {
-                        slotDidAppear?()
-                    }
-                }
+            }
+        }
+        menu.activate()
+        self.transition(to: menu, style: .crossfade)
+    }
+    
+    private func bootLoaded(_ slot: SlotLoadResult) {
+        guard case let .loaded(name, slotMain, slotDidAppear, slotCreateWindow) = slot else {
+            if case let .failed(message) = slot {
+                self.enterRecovery(error: "ERROR: \(message)")
+            }
+            return
+        }
+        
+        guard let raw = slotMain() else {
+            self.enterRecovery(error: "ERROR: \(name) NXSlotMain returned no view controller")
+            return
+        }
+        let slotRoot = Unmanaged<UIViewController>.fromOpaque(raw).takeRetainedValue()
+        
+        self.changableStatusBarHidden = false
+        UIView.animate(withDuration: 0.3) {
+            self.setNeedsStatusBarAppearanceUpdate()
+        }
+        
+        if let slotCreateWindow, let slotWindow = self.makeSlotWindow(slotCreateWindow) {
+            self.transition(into: slotWindow, root: slotRoot) {
+                slotDidAppear?()
+            }
+        } else {
+            self.transition(to: slotRoot) {
+                slotDidAppear?()
             }
         }
     }
@@ -1264,10 +1330,20 @@ class BootViewController: UIViewController {
     private func transition(to child: UIViewController,
                             style: BootTransition = .zoomThrough,
                             completion: (() -> Void)? = nil) {
+        for existing in children where existing !== child {
+            existing.view.removeFromSuperview()
+            existing.willMove(toParent: nil)
+            existing.removeFromParent()
+        }
+        
         addChild(child)
         child.view.frame = view.bounds
         child.view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        view.insertSubview(child.view, belowSubview: splashView)
+        if splashView.superview != nil {
+            view.insertSubview(child.view, belowSubview: splashView)
+        } else {
+            view.insertSubview(child.view, at: 0)
+        }
         child.view.layoutIfNeeded()
         
         if let presentation = logoView.layer.presentation() {

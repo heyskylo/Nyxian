@@ -20,6 +20,7 @@
 */
 
 #import <UI/NXRecoveryViewController.h>
+#import <UI/NXRecoveryFont.h>
 #import <UI/NXVolumeButtonMonitor.h>
 
 static NSString * const NXRecoveryAtlasResource = @"recovery_font_18x32";
@@ -59,16 +60,6 @@ static void NXRecoveryReleaseData(void *info, const void *data, size_t size)
 {
     return [[self alloc] initWithTitle:title action:action];
 }
-
-@end
-
-@interface NXRecoveryFontAtlas : NSObject
-
-@property (nonatomic, readonly) NSInteger cellWidth;
-@property (nonatomic, readonly) NSInteger cellHeight;
-
-+ (nullable instancetype)sharedAtlas;
-- (nullable CGImageRef)imageTintedWithColor:(UIColor *)color;
 
 @end
 
@@ -201,18 +192,6 @@ static void NXRecoveryReleaseData(void *info, const void *data, size_t size)
     _tinted[color] = (__bridge_transfer id)image;
     return image;
 }
-
-@end
-
-@interface NXRecoveryGlyphView : UIView
-
-@property (nonatomic, copy) NSString *text;
-@property (nonatomic) BOOL bold;
-@property (nonatomic, strong) UIColor *color;
-@property (nonatomic) NSInteger glyphScale;
-@property (nonatomic) BOOL wraps;
-
-- (CGSize)cellSizeInPoints;
 
 @end
 
