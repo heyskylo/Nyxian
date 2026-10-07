@@ -24,6 +24,12 @@ jobs:
         with:
           submodules: recursive
 
+      - name: Cache LLVM build
+        uses: actions/cache@v4
+        with:
+          path: Frameworks/CoreCompiler/CoreCompilerSupportLibs
+          key: llvm-${{ runner.os }}-${{ hashFiles('LLVM-On-iOS/**') }}
+
       - name: Extract version
         run: |
           VERSION=$(awk -F'=' '/^[[:space:]]*VERSION[[:space:]]*=/ {gsub(/[[:space:]]/,"",$2); print $2; exit}' Config.xcconfig)
