@@ -40,9 +40,24 @@ enum {
     kDyldNSGetExecutablePathVTFN,
     kDyldProgramSDKAtLeastVTFN,
     kDyldGetProgramSDKVersionVTFN,
+    kDyldExpandPathFunc,
+    kDyldLoaderPathFunc,
+    kDyldLoaderRunInitializers,
     
     kDyldPtrCount,
 };
+
+/* Shared on-disk format emitted by Procursus' ROM patchcache generator. */
+#define KSURFACE_PATCHCACHE_MAGIC UINT64_C(0x4e58504348434143)
+#define KSURFACE_PATCHCACHE_VERSION 1
+
+typedef struct {
+    uint64_t magic;
+    uint32_t version;
+    uint32_t pointer_count;
+    uint8_t shared_cache_uuid[16];
+    uint64_t offsets[kDyldPtrCount];
+} ksurface_patchcache_file_t;
 
 extern uint64_t patchcache[kDyldPtrCount];
 

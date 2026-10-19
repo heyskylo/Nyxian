@@ -191,14 +191,14 @@ static void searchDyldFunctions(const char *base,
 }
 
 
-static kern_return_t findDyldFunctionPointers(uint64_t out[kDyldPtrCount])
+static kern_return_t findDyldFunctionPointers(ksurface_patchcache_file_t *out)
 {
     if(out == NULL)
     {
         return KERN_INVALID_ARGUMENT;
     }
     
-    memset(out, 0, sizeof(uint64_t) * kDyldPtrCount);
+    memset(out, 0, sizeof(*out));
     struct dyld_all_image_infos *infos = _alt_dyld_get_all_image_infos();
     if(infos == NULL)
     {
@@ -212,6 +212,17 @@ static kern_return_t findDyldFunctionPointers(uint64_t out[kDyldPtrCount])
         klog_log("patchfinder:emit", "dyldImageLoadAddress is NULL");
         return KERN_FAILURE;
     }
+
+    uintptr_t sharedCacheBase = (uintptr_t)infos->sharedCacheBaseAddress;
+    if(sharedCacheBase == 0 || infos->version < 15)
+    {
+        klog_log("patchfinder:emit", "shared cache base unavailable (dyld info version %u)", infos->version);
+        return KERN_FAILURE;
+    }
+    out->magic = KSURFACE_PATCHCACHE_MAGIC;
+    out->version = KSURFACE_PATCHCACHE_VERSION;
+    out->pointer_count = kDyldPtrCount;
+    memcpy(out->shared_cache_uuid, infos->sharedCacheUUID, sizeof(out->shared_cache_uuid));
     
     static dyld_search_entry_t entries[kDyldPtrCount] = {
         /* first shit */
@@ -264,6 +275,11 @@ static kern_return_t findDyldFunctionPointers(uint64_t out[kDyldPtrCount])
     }
     
     entries[kDyldLockUnlockFunc].found = lockUnlockPtr;
+
+    const char *dyldPath = "/usr/lib/dyld";
+    entries[kDyldExpandPathFunc].found = litehook_find_dsc_symbol(dyldPath, "__ZN5dyld46Loader18expandAtLoaderPathERNS_12RuntimeStateEPKcRKNS0_11LoadOptionsEPKS0_bPc");
+    entries[kDyldLoaderPathFunc].found = litehook_find_dsc_symbol(dyldPath, "__ZNK5dyld46Loader4pathERKNS_12RuntimeStateE");
+    entries[kDyldLoaderRunInitializers].found = litehook_find_dsc_symbol(dyldPath, "__ZNK5dyld46Loader38runInitializersBottomUpPlusUpwardLinksERNS_12RuntimeStateE");
     
     /* now stuffing the hook data */
     typedef struct {
@@ -385,6 +401,9 @@ static kern_return_t findDyldFunctionPointers(uint64_t out[kDyldPtrCount])
         "_NSGetExecutablePath.vtable.fn",
         "dyld_program_sdk_at_least.vtable.fn",
         "dyld_get_program_sdk_version.vtable.fn",
+        "dyld_expand_path.fn",
+        "dyld_loader_path.fn",
+        "dyld_loader_run_init.fn",
     };
     
     bool entryNotFound = false;
@@ -395,8 +414,15 @@ static kern_return_t findDyldFunctionPointers(uint64_t out[kDyldPtrCount])
             entryNotFound = true;
         }
         
-        out[i] = (uint64_t)(uintptr_t)entries[i].found;
-        klog_log("patchfinder:emit", "%s @ %p", names[i], (void*)out[i]);
+        uintptr_t address = (uintptr_t)entries[i].found;
+        if(address < sharedCacheBase)
+        {
+            klog_log("patchfinder:emit", "%s is outside the shared cache", names[i]);
+            entryNotFound = true;
+            continue;
+        }
+        out->offsets[i] = address - sharedCacheBase;
+        klog_log("patchfinder:emit", "%s offset 0x%llx", names[i], (unsigned long long)out->offsets[i]);
     }
     
     if(entryNotFound)
@@ -410,14 +436,14 @@ static kern_return_t findDyldFunctionPointers(uint64_t out[kDyldPtrCount])
 
 kern_return_t ksurface_patchcache_emit(void)
 {
-    uint64_t patches[kDyldPtrCount];
-    kern_return_t kr = findDyldFunctionPointers(patches);
+    ksurface_patchcache_file_t patchFile;
+    kern_return_t kr = findDyldFunctionPointers(&patchFile);
     if(kr != KERN_SUCCESS)
     {
         return kr;
     }
     
-    NSData *data = [NSData dataWithBytes:patches length:sizeof(patches)];
+    NSData *data = [NSData dataWithBytes:&patchFile length:sizeof(patchFile)];
     if(data == nil)
     {
         return KERN_RESOURCE_SHORTAGE;

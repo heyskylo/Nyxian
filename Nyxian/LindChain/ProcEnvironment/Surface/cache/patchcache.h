@@ -24,25 +24,7 @@
 
 #include <stdint.h>
 #include <mach/kern_return.h>
-
-enum {
-    /* for the RO file system sandbox mmap bypass */
-    kDyldPtrOpen = 0,
-    kDyldPtrFcntl,
-    kDyldPtrFstat64,
-    kDyldPtrStat64,
-    kDyldPtrOpenat,
-    
-    /* for the dlopen with the lock bypasses */
-    kDyldLockUnlockFunc,
-    
-    /* dyld hook ptrs */
-    kDyldNSGetExecutablePathVTFN,
-    kDyldProgramSDKAtLeastVTFN,
-    kDyldGetProgramSDKVersionVTFN,
-    
-    kDyldPtrCount,
-};
+#include <LiveShim/patchcache.h>
 
 kern_return_t ksurface_patchcache_emit(void);
 
